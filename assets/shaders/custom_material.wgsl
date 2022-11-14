@@ -9,6 +9,7 @@
 #import bevy_pbr::pbr_functions
 
 @group(1) @binding(0)
+//var texture: texture_multisampled_2d<f32>;
 var texture: texture_2d<f32>;
 @group(1) @binding(1)
 var texture_sampler: sampler;

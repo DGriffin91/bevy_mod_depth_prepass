@@ -1,20 +1,40 @@
-//! Run a prepass before the main pass to get the depth and/or normals texture.
-//! The depth prepass texture is then used by the main pass to reduce overdraw.
-//!
-//! To enable the prepass, you need to add a `PrepassSettings` component to a `Camera`.
-//! Both textures are available on the `PrepassTextures` component attached to each `Camera` with a `PrepassSettings`
-//!
-//! Currently only works for 3d
-
 use bevy::{
+    asset::load_internal_asset,
+    core_pipeline::core_3d,
+    ecs::system::{
+        lifetimeless::{Read, SQuery, SRes},
+        SystemParamItem,
+    },
+    pbr::{DrawMesh, MeshPipeline, MeshUniform, SetMeshBindGroup},
     prelude::*,
+    reflect::TypeUuid,
+    render::{
+        render_asset::RenderAssets,
+        render_graph::RenderGraph,
+        render_phase::{
+            sort_phase_system, AddRenderCommand, DrawFunctions, EntityRenderCommand,
+            RenderCommandResult, RenderPhase, SetItemPipeline, TrackedRenderPass,
+        },
+        render_resource::{
+            BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
+            BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, BlendState,
+            BufferBindingType, ColorTargetState, ColorWrites, CompareFunction, DepthBiasState,
+            DepthStencilState, FragmentState, FrontFace, MultisampleState, PipelineCache,
+            PolygonMode, PrimitiveState, RenderPipelineDescriptor, ShaderStages, ShaderType,
+            StencilState, TextureFormat, VertexState,
+        },
+        renderer::RenderDevice,
+        view::{ExtractedView, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities},
+        Extract, RenderApp, RenderStage,
+    },
     render::{
         render_phase::{CachedRenderPipelinePhaseItem, DrawFunctionId, EntityPhaseItem, PhaseItem},
         render_resource::{CachedRenderPipelineId, Extent3d},
-        texture::CachedTexture,
     },
     utils::FloatOrd,
 };
+
+use crate::node::PrepassNode;
 
 /// Textures that are written to by the prepass. The texture only exists if the relevant option on `PrepassSettings` is true.
 #[derive(Component, Clone)]
@@ -64,41 +84,289 @@ impl CachedRenderPipelinePhaseItem for Opaque3dPrepass {
     }
 }
 
-pub struct AlphaMask3dPrepass {
-    pub distance: f32,
-    pub entity: Entity,
-    pub pipeline_id: CachedRenderPipelineId,
-    pub draw_function: DrawFunctionId,
+pub const PREPASS_DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
+
+pub const PREPASS_SHADER_HANDLE: HandleUntyped =
+    HandleUntyped::weak_from_u64(Shader::TYPE_UUID, 923124473264008993);
+
+pub const PREPASS_BINDINGS_SHADER_HANDLE: HandleUntyped =
+    HandleUntyped::weak_from_u64(Shader::TYPE_UUID, 5532152893187403690);
+
+pub struct PrepassPlugin;
+
+impl Plugin for PrepassPlugin {
+    fn build(&self, app: &mut App) {
+        load_internal_asset!(
+            app,
+            PREPASS_SHADER_HANDLE,
+            "prepass.wgsl",
+            Shader::from_wgsl
+        );
+
+        load_internal_asset!(
+            app,
+            PREPASS_BINDINGS_SHADER_HANDLE,
+            "prepass_bindings.wgsl",
+            Shader::from_wgsl
+        );
+
+        let render_app = match app.get_sub_app_mut(RenderApp) {
+            Ok(render_app) => render_app,
+            Err(_) => return,
+        };
+
+        render_app
+            .add_system_to_stage(RenderStage::Extract, extract_core_3d_camera_prepass_phase)
+            .add_system_to_stage(RenderStage::Queue, queue_prepass_view_bind_group)
+            .add_system_to_stage(RenderStage::Queue, queue_prepass_material_meshes)
+            .add_system_to_stage(RenderStage::PhaseSort, sort_phase_system::<Opaque3dPrepass>)
+            .init_resource::<PrepassPipeline>()
+            .init_resource::<DrawFunctions<Opaque3dPrepass>>()
+            .init_resource::<PrepassViewBindGroup>()
+            .add_render_command::<Opaque3dPrepass, DrawPrepass>();
+
+        {
+            let prepass_node = PrepassNode::new(&mut render_app.world);
+            let mut binding = render_app.world.resource_mut::<RenderGraph>();
+            let draw_3d_graph = binding.get_sub_graph_mut(core_3d::graph::NAME).unwrap();
+
+            draw_3d_graph.add_node("PREPASS", prepass_node);
+            draw_3d_graph
+                .add_slot_edge(
+                    draw_3d_graph.input_node().unwrap().id,
+                    core_3d::graph::input::VIEW_ENTITY,
+                    "PREPASS",
+                    PrepassNode::IN_VIEW,
+                )
+                .unwrap();
+            draw_3d_graph
+                .add_node_edge("PREPASS", core_3d::graph::node::MAIN_PASS)
+                .unwrap();
+        }
+    }
 }
 
-impl PhaseItem for AlphaMask3dPrepass {
-    type SortKey = FloatOrd;
+#[derive(Resource)]
+pub struct PrepassPipeline {
+    pub view_layout: BindGroupLayout,
+    pub mesh_layout: BindGroupLayout,
+    pub skinned_mesh_layout: BindGroupLayout,
+}
 
-    #[inline]
-    fn sort_key(&self) -> Self::SortKey {
-        FloatOrd(self.distance)
-    }
+impl FromWorld for PrepassPipeline {
+    fn from_world(world: &mut World) -> Self {
+        let render_device = world.resource::<RenderDevice>();
 
-    #[inline]
-    fn draw_function(&self) -> DrawFunctionId {
-        self.draw_function
-    }
+        let view_layout = render_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            entries: &[
+                // View
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: Some(ViewUniform::min_size()),
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("prepass_view_layout"),
+        });
 
-    #[inline]
-    fn sort(items: &mut [Self]) {
-        radsort::sort_by_key(items, |item| item.distance);
+        let mesh_pipeline = world.resource::<MeshPipeline>();
+
+        PrepassPipeline {
+            view_layout,
+            mesh_layout: mesh_pipeline.mesh_layout.clone(),
+            skinned_mesh_layout: mesh_pipeline.skinned_mesh_layout.clone(),
+        }
     }
 }
 
-impl EntityPhaseItem for AlphaMask3dPrepass {
-    fn entity(&self) -> Entity {
-        self.entity
+pub fn extract_core_3d_camera_prepass_phase(
+    mut commands: Commands,
+    cameras_3d: Extract<Query<(Entity, &Camera, &ViewPrepassTextures), With<Camera3d>>>,
+) {
+    for (entity, camera, prepass_textures) in cameras_3d.iter() {
+        if camera.is_active {
+            commands.get_or_spawn(entity).insert((
+                RenderPhase::<Opaque3dPrepass>::default(),
+                prepass_textures.clone(),
+            ));
+        }
     }
 }
 
-impl CachedRenderPipelinePhaseItem for AlphaMask3dPrepass {
-    #[inline]
-    fn cached_pipeline(&self) -> CachedRenderPipelineId {
-        self.pipeline_id
+#[derive(Resource, Default)]
+pub struct PrepassViewBindGroup {
+    bind_group: Option<BindGroup>,
+}
+
+pub fn queue_prepass_view_bind_group(
+    render_device: Res<RenderDevice>,
+    prepass_pipeline: Res<PrepassPipeline>,
+    view_uniforms: Res<ViewUniforms>,
+    mut prepass_view_bind_group: ResMut<PrepassViewBindGroup>,
+) {
+    if let Some(view_binding) = view_uniforms.uniforms.binding() {
+        prepass_view_bind_group.bind_group =
+            Some(render_device.create_bind_group(&BindGroupDescriptor {
+                entries: &[BindGroupEntry {
+                    binding: 0,
+                    resource: view_binding,
+                }],
+                label: Some("prepass_view_bind_group"),
+                layout: &prepass_pipeline.view_layout,
+            }));
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn queue_prepass_material_meshes(
+    opaque_draw_functions: Res<DrawFunctions<Opaque3dPrepass>>,
+    prepass_pipeline: Res<PrepassPipeline>,
+    mut pipeline_cache: ResMut<PipelineCache>,
+    render_meshes: Res<RenderAssets<Mesh>>,
+    material_meshes: Query<(&Handle<Mesh>, &MeshUniform)>,
+    msaa: Res<Msaa>,
+    mut views: Query<(
+        &ExtractedView,
+        &VisibleEntities,
+        &ViewPrepassTextures,
+        &mut RenderPhase<Opaque3dPrepass>,
+    )>,
+) {
+    let opaque_draw_prepass = opaque_draw_functions
+        .read()
+        .get_id::<DrawPrepass>()
+        .unwrap();
+
+    for (view, visible_entities, _prepass_textures, mut opaque_phase) in &mut views {
+        let rangefinder = view.rangefinder3d();
+
+        for visible_entity in &visible_entities.entities {
+            if let Ok((mesh_handle, mesh_uniform)) = material_meshes.get(*visible_entity) {
+                if let Some(mesh) = render_meshes.get(mesh_handle) {
+                    let mut bind_group_layout = vec![prepass_pipeline.view_layout.clone()];
+                    let layout = &mesh.layout;
+
+                    let mut shader_defs = Vec::new();
+                    let mut vertex_attributes = Vec::new();
+
+                    shader_defs.push(String::from("PREPASS_DEPTH"));
+
+                    if layout.contains(Mesh::ATTRIBUTE_POSITION) {
+                        shader_defs.push(String::from("VERTEX_POSITIONS"));
+                        vertex_attributes.push(Mesh::ATTRIBUTE_POSITION.at_shader_location(0));
+                    }
+
+                    if layout.contains(Mesh::ATTRIBUTE_UV_0) {
+                        shader_defs.push(String::from("VERTEX_UVS"));
+                        vertex_attributes.push(Mesh::ATTRIBUTE_UV_0.at_shader_location(1));
+                    }
+
+                    vertex_attributes.push(Mesh::ATTRIBUTE_NORMAL.at_shader_location(2));
+                    shader_defs.push(String::from("PREPASS_NORMALS"));
+
+                    if layout.contains(Mesh::ATTRIBUTE_JOINT_INDEX)
+                        && layout.contains(Mesh::ATTRIBUTE_JOINT_WEIGHT)
+                    {
+                        shader_defs.push(String::from("SKINNED"));
+                        vertex_attributes.push(Mesh::ATTRIBUTE_JOINT_INDEX.at_shader_location(4));
+                        vertex_attributes.push(Mesh::ATTRIBUTE_JOINT_WEIGHT.at_shader_location(5));
+                        bind_group_layout.insert(1, prepass_pipeline.skinned_mesh_layout.clone());
+                    } else {
+                        bind_group_layout.insert(1, prepass_pipeline.mesh_layout.clone());
+                    }
+
+                    let vertex_buffer_layout = layout.get_layout(&vertex_attributes).unwrap();
+
+                    let prepass_shader = PREPASS_SHADER_HANDLE.typed::<Shader>();
+
+                    let fragment = Some(FragmentState {
+                        shader: prepass_shader.clone(),
+                        entry_point: "fragment".into(),
+                        shader_defs: shader_defs.clone(),
+                        targets: vec![Some(ColorTargetState {
+                            format: TextureFormat::Rgba16Float,
+                            blend: Some(BlendState::REPLACE),
+                            write_mask: ColorWrites::ALL,
+                        })],
+                    });
+
+                    let descriptor = RenderPipelineDescriptor {
+                        vertex: VertexState {
+                            shader: prepass_shader,
+                            entry_point: "vertex".into(),
+                            shader_defs,
+                            buffers: vec![vertex_buffer_layout],
+                        },
+                        fragment,
+                        layout: Some(bind_group_layout),
+                        primitive: PrimitiveState {
+                            topology: mesh.primitive_topology,
+                            strip_index_format: None,
+                            front_face: FrontFace::Ccw,
+                            cull_mode: None,
+                            unclipped_depth: false,
+                            polygon_mode: PolygonMode::Fill,
+                            conservative: false,
+                        },
+                        depth_stencil: Some(DepthStencilState {
+                            format: PREPASS_DEPTH_FORMAT,
+                            depth_write_enabled: true,
+                            depth_compare: CompareFunction::GreaterEqual,
+                            stencil: StencilState::default(),
+                            bias: DepthBiasState::default(),
+                        }),
+                        multisample: MultisampleState {
+                            count: msaa.samples,
+                            mask: !0,
+                            alpha_to_coverage_enabled: false,
+                        },
+                        label: Some("prepass_pipeline".into()),
+                    };
+
+                    let distance = rangefinder.distance(&mesh_uniform.transform);
+
+                    opaque_phase.add(Opaque3dPrepass {
+                        entity: *visible_entity,
+                        draw_function: opaque_draw_prepass,
+                        pipeline_id: pipeline_cache.queue_render_pipeline(descriptor),
+                        distance,
+                    });
+                }
+            }
+        }
+    }
+}
+
+pub struct SetPrepassViewBindGroup<const I: usize>;
+impl<const I: usize> EntityRenderCommand for SetPrepassViewBindGroup<I> {
+    type Param = (SRes<PrepassViewBindGroup>, SQuery<Read<ViewUniformOffset>>);
+    #[inline]
+    fn render<'w>(
+        view: Entity,
+        _item: Entity,
+        (prepass_view_bind_group, view_query): SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let view_uniform_offset = view_query.get(view).unwrap();
+        let prepass_view_bind_group = prepass_view_bind_group.into_inner();
+        pass.set_bind_group(
+            I,
+            prepass_view_bind_group.bind_group.as_ref().unwrap(),
+            &[view_uniform_offset.offset],
+        );
+
+        RenderCommandResult::Success
+    }
+}
+
+pub type DrawPrepass = (
+    SetItemPipeline,
+    SetPrepassViewBindGroup<0>,
+    SetMeshBindGroup<1>,
+    DrawMesh,
+);

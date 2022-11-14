@@ -1,38 +1,30 @@
 //! A simple 3D scene with light shining over a cube sitting on a plane.
 
 mod node;
+
 mod prepass;
-mod prepass_render;
 
 use bevy::{
-    core_pipeline::core_3d,
+    core_pipeline::fxaa::Fxaa,
     prelude::*,
     reflect::TypeUuid,
-    render::{
-        render_graph::RenderGraph,
-        render_resource::{
-            AsBindGroup, Extent3d, ShaderRef, TextureDescriptor, TextureDimension, TextureFormat,
-            TextureUsages,
-        },
-        RenderApp,
+    render::render_resource::{
+        AsBindGroup, Extent3d, ShaderRef, TextureDescriptor, TextureDimension, TextureFormat,
+        TextureUsages,
     },
     window::WindowResized,
 };
-use node::PrepassNode;
-use prepass::ViewPrepassTextures;
-use prepass_render::PrepassPlugin;
+
+use prepass::{PrepassPlugin, ViewPrepassTextures};
 
 fn main() {
     App::new()
-        // not working, haven't gotten everywhere configured with the same multisample
         .insert_resource(Msaa { samples: 1 })
         .add_plugins(DefaultPlugins)
-        .add_plugin(PrepassNodePlugin)
-        // PrepassPlugin probably doesn't need to be generic
-        .add_plugin(PrepassPlugin::<CustomMaterial>::default())
+        .add_plugin(PrepassPlugin)
         .add_plugin(MaterialPlugin::<CustomMaterial>::default())
-        //.add_system(window_resized)
         .add_startup_system(setup)
+        .add_system_to_stage(CoreStage::PreUpdate, window_resized)
         .run();
 }
 
@@ -48,10 +40,11 @@ fn setup(
     let window = windows.get_primary_mut().unwrap();
 
     let size = Extent3d {
-        width: window.physical_width(),
-        height: window.physical_height(),
+        width: window.physical_width() as u32,
+        height: window.physical_height() as u32,
         ..default()
     };
+
     // This is the texture that will be rendered to.
     let mut image = Image {
         texture_descriptor: TextureDescriptor {
@@ -60,7 +53,7 @@ fn setup(
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba16Float,
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: msaa.samples,
             usage: TextureUsages::TEXTURE_BINDING
                 | TextureUsages::RENDER_ATTACHMENT
                 | TextureUsages::COPY_DST,
@@ -108,31 +101,25 @@ fn setup(
         .insert(ViewPrepassTextures {
             normals_depth: image_handle,
             size,
-        });
+        })
+        .insert(Fxaa::default());
 }
 
-// Not working
-/*
-Caused by:
-    In a RenderPass
-      note: encoder = `<CommandBuffer-(0, 1, Vulkan)>`
-    In a pass parameter
-      note: command buffer = `<CommandBuffer-(0, 1, Vulkan)>`
-    attachments have differing sizes: ("depth", Extent3d { width: 1600, height: 900, depth_or_array_layers: 1 })
-    is followed by ("color", Extent3d { width: 1280, height: 720, depth_or_array_layers: 1 })
-*/
 fn window_resized(
     mut window_resized_events: EventReader<WindowResized>,
     mut images: ResMut<Assets<Image>>,
     mut image_events: EventWriter<AssetEvent<Image>>,
     mut prepass_textures: Query<&mut ViewPrepassTextures>,
     mut mats: ResMut<Assets<CustomMaterial>>,
+    mut windows: ResMut<Windows>,
 ) {
-    if let Some(event) = window_resized_events.iter().last() {
-        dbg!(&event);
+    if let Some(_event) = window_resized_events.iter().last() {
+        //event.width does not match window.physical_width()
+        let window = windows.get_primary_mut().unwrap();
+
         let size = Extent3d {
-            width: event.width as u32,
-            height: event.height as u32,
+            width: window.physical_width() as u32,
+            height: window.physical_height() as u32,
             ..default()
         };
 
@@ -143,7 +130,7 @@ fn window_resized(
             image_events.send(AssetEvent::Modified {
                 handle: prepass_texture.normals_depth.clone(),
             });
-            for mat in mats.iter_mut() {
+            for _ in mats.iter_mut() {
                 //Touch material
             }
         }
@@ -159,34 +146,8 @@ impl Material for CustomMaterial {
 #[derive(AsBindGroup, Debug, Clone, TypeUuid)]
 #[uuid = "717f64fe-6844-4822-8926-e0ed374244c8"]
 pub struct CustomMaterial {
+    //#[texture(0, multisampled = true)]
     #[texture(0)]
     #[sampler(1)]
     pub depth_normal_prepass_texture: Option<Handle<Image>>,
-}
-
-pub struct PrepassNodePlugin;
-impl Plugin for PrepassNodePlugin {
-    fn build(&self, app: &mut App) {
-        let render_app = match app.get_sub_app_mut(RenderApp) {
-            Ok(render_app) => render_app,
-            Err(_) => return,
-        };
-
-        let prepass_node = PrepassNode::new(&mut render_app.world);
-        let mut binding = render_app.world.resource_mut::<RenderGraph>();
-        let draw_3d_graph = binding.get_sub_graph_mut(core_3d::graph::NAME).unwrap();
-
-        draw_3d_graph.add_node("PREPASS", prepass_node);
-        draw_3d_graph
-            .add_slot_edge(
-                draw_3d_graph.input_node().unwrap().id,
-                core_3d::graph::input::VIEW_ENTITY,
-                "PREPASS",
-                PrepassNode::IN_VIEW,
-            )
-            .unwrap();
-        draw_3d_graph
-            .add_node_edge("PREPASS", core_3d::graph::node::MAIN_PASS)
-            .unwrap();
-    }
 }
