@@ -23,6 +23,8 @@ struct FragmentInput {
 let PHIMINUS1: f32 = 0.61803398875;
 let TAU: f32 = 6.2831853071795864769252867665590;
 
+// The points go from z = +1 down to z = -1 in a spiral. To generate samples on the +z hemisphere,
+// just stop before i > N/2.
 fn sphericalFibonacci(i: f32, n: f32) -> vec3<f32> {
     let phi = TAU * fract(i * PHIMINUS1);
     let cosTheta = 1.0 - (2.0 * i + 1.0) * (1.0 / n);
@@ -42,17 +44,17 @@ fn ssao(radius: f32, bias: f32, frag_view: vec3<f32>, frag_coord: vec2<f32>, nor
     let frame_size = view.viewport.zw;
     let view_uv = frag_coord / frame_size;
 
-    let kernel_size = 24.0;
-    let double_kernel_size = kernel_size * 2.0;
+    let kernel_size = 16.0;
+    //1.0 would be sphere, 2.0 would be hemisphere
+    let kernel_size_fib = kernel_size * 4.0; 
 
     var occlusion: f32 = 0.0;
 
     let i_kernel_size = i32(kernel_size);
 
-    let rx = rand(frag_coord.x);
-    let ry = rand(frag_coord.y);
-    let rz = rand(rx+ry);
-
+    let rx = rand(frag_coord.x) - 0.5;
+    let ry = rand(frag_coord.y) - 0.5;
+    let rz = rand(rx+ry) - 0.5;
 
     let randomVec = vec3(rx, ry, rz);
     let tangent = normalize(randomVec - normal_view * dot(randomVec, normal_view));
@@ -60,7 +62,7 @@ fn ssao(radius: f32, bias: f32, frag_view: vec3<f32>, frag_coord: vec2<f32>, nor
     let TBN = mat3x3<f32>(tangent, bitangent, normal_view);
 
     for (var i = 0; i < i_kernel_size; i = i + 1) {
-        let sample_offset_view = TBN * sphericalFibonacci(f32(i), double_kernel_size); // from tangent to view space
+        let sample_offset_view = TBN * sphericalFibonacci(f32(i), kernel_size_fib); // from tangent to view space
         let sample_view = vec4<f32>(frag_view.xyz + sample_offset_view * radius, 1.0);
 
         let sample_clip = view.projection * sample_view; // from view to clip space
