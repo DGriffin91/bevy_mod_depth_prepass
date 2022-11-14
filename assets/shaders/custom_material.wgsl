@@ -42,14 +42,19 @@ fn ssao(radius: f32, bias: f32, frag_view: vec3<f32>, frag_coord: vec2<f32>, nor
     let frame_size = view.viewport.zw;
     let view_uv = frag_coord / frame_size;
 
-    let kernel_size = 64.0;
+    let kernel_size = 24.0;
     let double_kernel_size = kernel_size * 2.0;
 
     var occlusion: f32 = 0.0;
 
     let i_kernel_size = i32(kernel_size);
 
-    let randomVec = vec3(rand(frag_coord.x), rand(frag_coord.y), rand(frag_coord.x*frag_coord.y));
+    let rx = rand(frag_coord.x);
+    let ry = rand(frag_coord.y);
+    let rz = rand(rx+ry);
+
+
+    let randomVec = vec3(rx, ry, rz);
     let tangent = normalize(randomVec - normal_view * dot(randomVec, normal_view));
     let bitangent = cross(normal_view, tangent);
     let TBN = mat3x3<f32>(tangent, bitangent, normal_view);
@@ -85,7 +90,9 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {
     let frag_view_homogeneous = view.inverse_view * vec4<f32>(in.world_position.xyz, 1.0);
     var frag_view = frag_view_homogeneous.xyz / frag_view_homogeneous.w;
     let normal_view = (view.inverse_view * vec4(normal_depth.xyz, 0.0)).xyz;
-    var ssao_v = ssao(0.25, 0.025, frag_view, in.frag_coord.xy, normal_view);
+    var ssao_v = ssao(0.25, 0.0025, frag_view, in.frag_coord.xy, normal_view);
 
-    return vec4(vec3(dot(V, normal_view) * 0.5 * ssao_v*ssao_v*ssao_v), 1.0);
+    var col = vec3(dot(V, normal_view)) * 0.5;
+
+    return vec4(col * ssao_v, 1.0);
 }

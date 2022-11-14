@@ -8,14 +8,10 @@ use bevy::{
     core_pipeline::fxaa::Fxaa,
     prelude::*,
     reflect::TypeUuid,
-    render::render_resource::{
-        AsBindGroup, Extent3d, ShaderRef, TextureDescriptor, TextureDimension, TextureFormat,
-        TextureUsages,
-    },
-    window::WindowResized,
+    render::render_resource::{AsBindGroup, ShaderRef},
 };
 
-use prepass::{PrepassPlugin, ViewPrepassTextures};
+use prepass::{update_materials, PrepassPlugin, ViewPrepassTextures};
 
 fn main() {
     App::new()
@@ -24,7 +20,8 @@ fn main() {
         .add_plugin(PrepassPlugin)
         .add_plugin(MaterialPlugin::<CustomMaterial>::default())
         .add_startup_system(setup)
-        .add_system_to_stage(CoreStage::PreUpdate, window_resized)
+        //Update materials that use prepass as texture when texture size changes
+        .add_system(update_materials::<CustomMaterial>)
         .run();
 }
 
@@ -38,37 +35,13 @@ fn setup(
     msaa: Res<Msaa>,
 ) {
     let window = windows.get_primary_mut().unwrap();
-
-    let size = Extent3d {
-        width: window.physical_width() as u32,
-        height: window.physical_height() as u32,
-        ..default()
-    };
-
-    // This is the texture that will be rendered to.
-    let mut image = Image {
-        texture_descriptor: TextureDescriptor {
-            label: None,
-            size,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba16Float,
-            mip_level_count: 1,
-            sample_count: msaa.samples,
-            usage: TextureUsages::TEXTURE_BINDING
-                | TextureUsages::RENDER_ATTACHMENT
-                | TextureUsages::COPY_DST,
-        },
-        ..default()
-    };
-    // fill image.data with zeroes
-    image.resize(size);
-    let image_handle = images.add(image);
+    let prepass = ViewPrepassTextures::new(window, &mut images, &msaa);
 
     // plane
     commands.spawn(MaterialMeshBundle {
         mesh: meshes.add(Mesh::from(shape::Plane { size: 5.0 })),
         material: materials.add(CustomMaterial {
-            depth_normal_prepass_texture: Some(image_handle.clone()),
+            depth_normal_prepass_texture: Some(prepass.normals_depth.clone()),
         }),
         ..default()
     });
@@ -76,7 +49,7 @@ fn setup(
     commands.spawn(MaterialMeshBundle {
         mesh: meshes.add(Mesh::from(shape::Cube { size: 1.0 })),
         material: materials.add(CustomMaterial {
-            depth_normal_prepass_texture: Some(image_handle.clone()),
+            depth_normal_prepass_texture: Some(prepass.normals_depth.clone()),
         }),
         transform: Transform::from_xyz(0.0, 0.5, 0.0),
         ..default()
@@ -98,43 +71,8 @@ fn setup(
             transform: Transform::from_xyz(-2.0, 2.5, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
             ..default()
         })
-        .insert(ViewPrepassTextures {
-            normals_depth: image_handle,
-            size,
-        })
+        .insert(prepass)
         .insert(Fxaa::default());
-}
-
-fn window_resized(
-    mut window_resized_events: EventReader<WindowResized>,
-    mut images: ResMut<Assets<Image>>,
-    mut image_events: EventWriter<AssetEvent<Image>>,
-    mut prepass_textures: Query<&mut ViewPrepassTextures>,
-    mut mats: ResMut<Assets<CustomMaterial>>,
-    mut windows: ResMut<Windows>,
-) {
-    if let Some(_event) = window_resized_events.iter().last() {
-        //event.width does not match window.physical_width()
-        let window = windows.get_primary_mut().unwrap();
-
-        let size = Extent3d {
-            width: window.physical_width() as u32,
-            height: window.physical_height() as u32,
-            ..default()
-        };
-
-        if let Some(mut prepass_texture) = prepass_textures.iter_mut().next() {
-            let image = images.get_mut(&prepass_texture.normals_depth).unwrap();
-            image.resize(size);
-            prepass_texture.size = size;
-            image_events.send(AssetEvent::Modified {
-                handle: prepass_texture.normals_depth.clone(),
-            });
-            for _ in mats.iter_mut() {
-                //Touch material
-            }
-        }
-    }
 }
 
 impl Material for CustomMaterial {
