@@ -63,7 +63,7 @@ fn ssao(radius: f32, bias: f32, frag_view: vec3<f32>, frag_coord: vec2<f32>, nor
         // sample_ndc.y is [-1,1] bottom to top, so * -0.5 + 0.5 remaps to [0,1] top to bottom
         let depth_uv = vec2<f32>(sample_ndc.x * 0.5 + 0.5, sample_ndc.y * -0.5 + 0.5);
 
-        let depth = -textureLoad(texture, vec2<i32>(depth_uv * frame_size), 0).w;
+        let depth = -view.projection[3][2] / textureLoad(texture, vec2<i32>(depth_uv * frame_size), 0).w;
 
         let range_check = smoothstep(0.0, 1.0, radius / distance(frag_view.z, depth));
         if (depth >= sample_view.z + bias) {

@@ -50,11 +50,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     return out;
 }
 
-
-
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    var depth = distance(in.world_position.xyz, view.world_position.xyz);
-    return vec4(in.world_normal, depth);
+    return vec4(in.world_normal, in.clip_position.z);
 }
 
